@@ -276,7 +276,7 @@ const DICTIONARY = {
   'Ивана Циунчик': 'Ivana Tsiunchick',
   'Дарья Кот': 'Daria Kot',
   'Даша Першина': 'Dasha Pershina',
-  'Лиззи Вихарева': 'Lissy Vikhareva',
+  'лиccи вихарева': 'Lissy Vikhareva',
   'Миша Шматов': 'Misha Shmatov',
   'Карина Логинова': 'Karina Loginova',
   'Сан Пална': 'Sun Palna',
