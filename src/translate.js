@@ -88,7 +88,9 @@ async function processAttributes(root, lang) {
 async function processNode(root, lang) {
   const roots = getTranslationRoots(root);
   if (!roots.length) {
-    if (lang === 'en') console.log('[translate] no roots for node:', root);
+    if (lang === 'en' && TRANSLATE_DEBUG_LOGS) {
+      console.log('[translate] no roots for node:', root);
+    }
     return;
   }
 
@@ -109,7 +111,9 @@ async function processNode(root, lang) {
           while (el) {
             if (shouldSkip(el)) return NodeFilter.FILTER_SKIP;
             if (isExcludedElement(el)) {
-              console.log('[translate] ancestor excluded:', el.className || el.tagName, '→ skipped text:', JSON.stringify(node.nodeValue.trim().slice(0, 40)));
+              if (TRANSLATE_DEBUG_LOGS) {
+                console.log('[translate] ancestor excluded:', el.className || el.tagName, '→ skipped text:', JSON.stringify(node.nodeValue.trim().slice(0, 40)));
+              }
               return NodeFilter.FILTER_SKIP;
             }
             el = el.parentElement;
@@ -183,21 +187,25 @@ async function processNode(root, lang) {
       if (shouldSendToAPI(original)) {
         needAPI.push({ node, originalText: original });
       } else if (hasCyrillic(original)) {
-        console.log(
-          '[translate] API skipped for:', JSON.stringify(original.trim().slice(0, 60)),
-          '| cyr:', (original.match(/[А-Яа-яЁё]/g) || []).length,
-          '| lat:', (original.match(/[a-zA-Z]/g) || []).length,
-          '| len:', original.trim().length,
-        );
+        if (TRANSLATE_DEBUG_LOGS) {
+          console.log(
+            '[translate] API skipped for:', JSON.stringify(original.trim().slice(0, 60)),
+            '| cyr:', (original.match(/[А-Яа-яЁё]/g) || []).length,
+            '| lat:', (original.match(/[a-zA-Z]/g) || []).length,
+            '| len:', original.trim().length,
+          );
+        }
       }
     }
   }
 
-  console.log(
-    '[translate] roots:', roots.length,
-    'text nodes:', nodes.length,
-    'api queue:', needAPI.length,
-  );
+  if (TRANSLATE_DEBUG_LOGS) {
+    console.log(
+      '[translate] roots:', roots.length,
+      'text nodes:', nodes.length,
+      'api queue:', needAPI.length,
+    );
+  }
 
   await applyAPI(needAPI);
   await processAttributes(root, 'en');

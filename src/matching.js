@@ -35,20 +35,15 @@ function applyCase(translation, profile) {
 //  ПОДГОТОВКА СЛОВАРЕЙ
 // ============================================================
 
+let ACTIVE_DICTIONARY = { ...DICTIONARY };
+
 // Прямой словарь (RU → EN), ключи приведены к нижнему регистру
-const DICT_LOWER = {};
-for (const [k, v] of Object.entries(DICTIONARY)) {
-  DICT_LOWER[k.toLowerCase()] = v;
-}
+let DICT_LOWER = {};
 // Сортировка по убыванию длины: длинные фразы матчим раньше коротких
-const DICT_KEYS = Object.keys(DICT_LOWER).sort((a, b) => b.length - a.length);
+let DICT_KEYS = [];
 
 // Обратный словарь (EN → RU), значения приведены к нижнему регистру
-const DICT_REVERSE_LOWER = {};
-for (const [k, v] of Object.entries(DICTIONARY)) {
-  const vl = v.toLowerCase();
-  if (!DICT_REVERSE_LOWER[vl]) DICT_REVERSE_LOWER[vl] = k;
-}
+let DICT_REVERSE_LOWER = {};
 
 // Псевдонимы — дополнительные английские варианты → русский
 // (нельзя выразить через DICTIONARY из-за ограничения уникальности ключей)
@@ -64,11 +59,54 @@ const DICT_REVERSE_ALIASES = {
   'elizaveta': 'Елизавета',    // дубль: Elizaveta / Elisabeth
   'sophie': 'Софи',            // дубль: Sophie / Sofi
 };
-Object.assign(DICT_REVERSE_LOWER, DICT_REVERSE_ALIASES);
+let DICT_REVERSE_KEYS = [];
 
-const DICT_REVERSE_KEYS = Object.keys(DICT_REVERSE_LOWER).sort(
-  (a, b) => b.length - a.length,
-);
+function rebuildDictionaryIndexes() {
+  DICT_LOWER = {};
+  for (const [k, v] of Object.entries(ACTIVE_DICTIONARY)) {
+    if (!k || typeof k !== 'string') continue;
+    if (!v || typeof v !== 'string') continue;
+    DICT_LOWER[k.toLowerCase()] = v;
+  }
+  DICT_KEYS = Object.keys(DICT_LOWER).sort((a, b) => b.length - a.length);
+
+  DICT_REVERSE_LOWER = {};
+  for (const [k, v] of Object.entries(ACTIVE_DICTIONARY)) {
+    if (!k || typeof k !== 'string') continue;
+    if (!v || typeof v !== 'string') continue;
+    const vl = v.toLowerCase();
+    if (!DICT_REVERSE_LOWER[vl]) DICT_REVERSE_LOWER[vl] = k;
+  }
+
+  Object.assign(DICT_REVERSE_LOWER, DICT_REVERSE_ALIASES);
+  DICT_REVERSE_KEYS = Object.keys(DICT_REVERSE_LOWER).sort(
+    (a, b) => b.length - a.length,
+  );
+}
+
+function mergeDictionaryEntries(entries) {
+  if (!entries || typeof entries !== 'object') return 0;
+
+  let changed = 0;
+  for (const [ru, en] of Object.entries(entries)) {
+    const ruText = (ru || '').trim();
+    const enText = (en || '').trim();
+    if (!ruText || !enText) continue;
+
+    if (ACTIVE_DICTIONARY[ruText] !== enText) {
+      ACTIVE_DICTIONARY[ruText] = enText;
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    rebuildDictionaryIndexes();
+  }
+
+  return changed;
+}
+
+rebuildDictionaryIndexes();
 
 // ============================================================
 //  МАТЧИНГ

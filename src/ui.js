@@ -9,6 +9,7 @@ try {
   currentLang = DEFAULT_LANG;
 }
 let observer = null;
+const searchInputDebouncers = new WeakMap();
 
 // ============================================================
 //  КНОПКИ ПЕРЕКЛЮЧЕНИЯ
@@ -32,9 +33,125 @@ async function switchLanguage(lang) {
   setActiveButton(lang);
   try {
     await processNode(document.body, lang);
+    applyBilingualSearchSupport(document.body);
   } catch (err) {
     console.error('[translate] switchLanguage failed:', err);
   }
+}
+
+// ============================================================
+//  ДВУЯЗЫЧНЫЙ ПОИСК
+// ============================================================
+
+function buildSearchAlias(text) {
+  const value = (text || '').trim();
+  if (!value) return null;
+
+  let ru = value;
+  let en = value;
+
+  if (hasCyrillic(value)) {
+    const direct = translateViaDict(value).result.trim();
+    if (direct && !hasCyrillic(direct)) en = direct;
+  } else if (hasLatin(value)) {
+    const reverse = translateViaDictReverse(value).result.trim();
+    if (reverse && hasCyrillic(reverse)) ru = reverse;
+  }
+
+  if (!ru || !en || ru.toLowerCase() === en.toLowerCase()) return null;
+  return `${ru} ${en}`;
+}
+
+function injectSearchAliasIntoTitle(titleEl) {
+  if (!titleEl || titleEl.nodeType !== Node.ELEMENT_NODE) return;
+  if (titleEl.querySelector('.tr-search-alias')) return;
+
+  const titleText = (titleEl.textContent || '').trim();
+  if (!titleText) return;
+
+  const alias = buildSearchAlias(titleText);
+  if (!alias) return;
+
+  const aliasEl = document.createElement('span');
+  aliasEl.className = 'tr-search-alias';
+  aliasEl.setAttribute('data-skip-translate', '1');
+  aliasEl.setAttribute('aria-hidden', 'true');
+  aliasEl.style.cssText = 'position:absolute;left:-99999px;width:1px;height:1px;overflow:hidden;';
+  aliasEl.textContent = ` ${alias}`;
+
+  titleEl.appendChild(aliasEl);
+}
+
+function enhanceSearchAliases(root) {
+  if (!ENABLE_BILINGUAL_SEARCH || !SEARCH_PRODUCT_TITLE_SELECTORS) return;
+  if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+
+  if (root.matches && root.matches(SEARCH_PRODUCT_TITLE_SELECTORS)) {
+    injectSearchAliasIntoTitle(root);
+  }
+
+  if (!root.querySelectorAll) return;
+  root
+    .querySelectorAll(SEARCH_PRODUCT_TITLE_SELECTORS)
+    .forEach(injectSearchAliasIntoTitle);
+}
+
+async function normalizeSearchInput(input) {
+  if (!input || input.dataset.trSearchLock === '1') return;
+
+  const raw = (input.value || '').trim();
+  if (!raw || !hasCyrillic(raw)) return;
+
+  let normalized = translateViaDict(raw).result.trim();
+  if (!normalized || hasCyrillic(normalized)) {
+    const apiValue = await translateViaAPI(raw, 'ru|en');
+    if (apiValue) normalized = apiValue.trim();
+  }
+
+  if (!normalized || hasCyrillic(normalized)) return;
+  if (normalized.toLowerCase() === raw.toLowerCase()) return;
+
+  input.dataset.trSearchLock = '1';
+  input.setAttribute('data-search-original-query', raw);
+  input.value = normalized;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dataset.trSearchLock = '0';
+}
+
+function bindSearchInput(input) {
+  if (!input || input.dataset.trSearchBound === '1') return;
+  input.dataset.trSearchBound = '1';
+
+  input.addEventListener('input', () => {
+    const prev = searchInputDebouncers.get(input);
+    if (prev) clearTimeout(prev);
+
+    const timer = setTimeout(() => {
+      normalizeSearchInput(input).catch((err) => {
+        console.warn('[translate] search normalize failed:', err);
+      });
+    }, SEARCH_QUERY_DEBOUNCE_MS);
+
+    searchInputDebouncers.set(input, timer);
+  });
+}
+
+function bindBilingualSearchInputs(root) {
+  if (!ENABLE_BILINGUAL_SEARCH || !SEARCH_INPUT_SELECTORS) return;
+  if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+
+  if (root.matches && root.matches(SEARCH_INPUT_SELECTORS)) {
+    bindSearchInput(root);
+  }
+
+  if (!root.querySelectorAll) return;
+  root.querySelectorAll(SEARCH_INPUT_SELECTORS).forEach(bindSearchInput);
+}
+
+function applyBilingualSearchSupport(root) {
+  if (!ENABLE_BILINGUAL_SEARCH) return;
+  enhanceSearchAliases(root);
+  bindBilingualSearchInputs(root);
 }
 
 // ============================================================
@@ -50,6 +167,7 @@ function startObserver() {
         processNode(added, currentLang).catch((err) => {
           console.error('[translate] mutation translate failed:', err);
         });
+        applyBilingualSearchSupport(added);
       }
     }
   });
@@ -103,8 +221,16 @@ function injectStyles() {
 //  ИНИЦИАЛИЗАЦИЯ
 // ============================================================
 
-function init() {
+async function init() {
   console.log('[translate] 🚀 init started, lang:', currentLang);
+
+  try {
+    await syncDictionaryFromGoogleSheets();
+  } catch (err) {
+    console.warn('[translate] Google Sheets sync failed:', err);
+  }
+
+  applyBilingualSearchSupport(document.body);
 
   injectStyles();
   console.log('[translate] ✅ styles injected');

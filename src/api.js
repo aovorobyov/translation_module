@@ -75,6 +75,204 @@ function saveCache() {
   } catch (_) {}
 }
 
+function loadRemoteDictionaryCache() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_REMOTE_DICT) || '{}';
+    const ts = Number(localStorage.getItem(STORAGE_KEY_REMOTE_DICT_TS) || 0);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { entries: null, ts: 0 };
+    return { entries: parsed, ts };
+  } catch (_) {
+    return { entries: null, ts: 0 };
+  }
+}
+
+function saveRemoteDictionaryCache(entries) {
+  try {
+    localStorage.setItem(STORAGE_KEY_REMOTE_DICT, JSON.stringify(entries));
+    localStorage.setItem(STORAGE_KEY_REMOTE_DICT_TS, String(Date.now()));
+  } catch (_) {}
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+
+  result.push(current.trim());
+  return result;
+}
+
+function parseGoogleSheetsCSV(text) {
+  const rows = (text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (!rows.length) return {};
+
+  // Заголовки могут быть не в первой строке (часто A2/B2),
+  // поэтому ищем их в первых строках файла.
+  let headerRowIndex = -1;
+  let ruIndex = -1;
+  let enIndex = -1;
+
+  const scanLimit = Math.min(rows.length, 12);
+  for (let rowIndex = 0; rowIndex < scanLimit; rowIndex += 1) {
+    const headers = parseCSVLine(rows[rowIndex]).map((h) => h.toLowerCase());
+    const maybeRu = headers.findIndex((h) => ['ru', 'рус', 'русский'].includes(h));
+    const maybeEn = headers.findIndex((h) => ['en', 'eng', 'english', 'англ', 'английский'].includes(h));
+    if (maybeRu !== -1 && maybeEn !== -1) {
+      headerRowIndex = rowIndex;
+      ruIndex = maybeRu;
+      enIndex = maybeEn;
+      break;
+    }
+  }
+
+  if (headerRowIndex === -1 || ruIndex === -1 || enIndex === -1) {
+    console.warn('[translate] Google Sheets: expected RU/EN headers not found in first rows');
+    return {};
+  }
+
+  const entries = {};
+  for (let i = headerRowIndex + 1; i < rows.length; i += 1) {
+    const cols = parseCSVLine(rows[i]);
+    const ru = (cols[ruIndex] || '').trim();
+    const en = (cols[enIndex] || '').trim();
+    if (!ru || !en) continue;
+    entries[ru] = en;
+  }
+
+  return entries;
+}
+
+function normalizeGoogleSheetsCSVUrl(url) {
+  const raw = (url || '').trim();
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    const isGoogleSheets = /(^|\.)docs\.google\.com$/.test(parsed.hostname);
+    const sheetMatch = parsed.pathname.match(/\/spreadsheets\/d\/([^/]+)/);
+    if (!isGoogleSheets || !sheetMatch) return raw;
+
+    const sheetId = sheetMatch[1];
+    const gid = parsed.searchParams.get('gid') || '0';
+
+    // Если уже export csv или pubcsv — оставляем как есть.
+    if (parsed.pathname.includes('/export') || parsed.searchParams.get('output') === 'csv') {
+      return raw;
+    }
+
+    return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${encodeURIComponent(gid)}`;
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function fetchGoogleSheetsDictionary() {
+  if (!GOOGLE_SHEETS_SYNC_ENABLED || !GOOGLE_SHEETS_CSV_URL) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOOGLE_SHEETS_FETCH_TIMEOUT_MS);
+  const csvUrl = normalizeGoogleSheetsCSVUrl(GOOGLE_SHEETS_CSV_URL);
+  console.log('[translate] Google Sheets URL:', csvUrl);
+
+  try {
+    const response = await fetch(csvUrl, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn('[translate] Google Sheets fetch failed:', response.status);
+      return null;
+    }
+
+    const csv = await response.text();
+    if (/<!doctype html>|<html/i.test(csv)) {
+      console.warn('[translate] Google Sheets response is HTML, expected CSV. Check table access and URL format.');
+      return null;
+    }
+
+    const parsed = parseGoogleSheetsCSV(csv);
+    console.log('[translate] Google Sheets parsed entries:', Object.keys(parsed).length);
+    return parsed;
+  } catch (err) {
+    console.warn('[translate] Google Sheets fetch error:', err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function syncDictionaryFromGoogleSheets() {
+  if (!GOOGLE_SHEETS_SYNC_ENABLED || !GOOGLE_SHEETS_CSV_URL) return 0;
+
+  const { entries: cachedEntries, ts } = loadRemoteDictionaryCache();
+  const cachedSize = cachedEntries && typeof cachedEntries === 'object'
+    ? Object.keys(cachedEntries).length
+    : 0;
+  const isFresh = ts > 0 && Date.now() - ts < GOOGLE_SHEETS_SYNC_TTL_MS;
+
+  if (isFresh && cachedEntries && cachedSize > 0) {
+    const changed = mergeDictionaryEntries(cachedEntries);
+    console.log('[translate] Google Sheets dictionary source: cache, rows:', cachedSize, 'applied:', changed);
+    return changed;
+  }
+
+  if (isFresh && cachedSize === 0) {
+    console.warn('[translate] Google Sheets cache is empty, forcing refetch');
+  }
+
+  const entries = await fetchGoogleSheetsDictionary();
+  if (!entries) {
+    if (cachedEntries && cachedSize > 0) {
+      const changed = mergeDictionaryEntries(cachedEntries);
+      console.log('[translate] Google Sheets dictionary source: fallback cache, rows:', cachedSize, 'applied:', changed);
+      return changed;
+    }
+    console.warn('[translate] Google Sheets dictionary unavailable, no cache rows');
+    return 0;
+  }
+
+  const fetchedSize = Object.keys(entries).length;
+  if (fetchedSize > 0) {
+    saveRemoteDictionaryCache(entries);
+  } else {
+    console.warn('[translate] Google Sheets fetched 0 rows, cache not overwritten');
+  }
+
+  const changed = mergeDictionaryEntries(entries);
+  console.log('[translate] Google Sheets dictionary source: network, rows:', fetchedSize, 'applied:', changed);
+  return changed;
+}
+
 /**
  * Переводит один текст: кэш → MyMemory → LibreTranslate.
  * langpair: 'ru|en' (по умолчанию) или 'en|ru' для обратного перевода.

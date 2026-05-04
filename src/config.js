@@ -15,6 +15,8 @@ const LIBRE_URL = 'https://translate.terraprint.co/translate';
 
 const STORAGE_KEY_LANG  = 'site_lang';
 const STORAGE_KEY_CACHE = 'site_tr_cache';
+const STORAGE_KEY_REMOTE_DICT = 'site_tr_remote_dict';
+const STORAGE_KEY_REMOTE_DICT_TS = 'site_tr_remote_dict_ts';
 const DEFAULT_LANG      = 'ru';
 
 const ATTR_ORIGINAL              = 'data-orig-text';
@@ -77,6 +79,31 @@ const API_MIN_TEXT_LENGTH       = 2;
 const API_REQUIRE_CYRILLIC      = true;
 const API_MAX_UNIQUE_PER_PASS   = 120;
 const TRANSLATABLE_ATTRIBUTES   = ['placeholder', 'value'];
+
+// Двуязычный поиск в каталоге: RU-запросы нормализуем в EN и добавляем RU/EN алиасы к карточкам.
+const ENABLE_BILINGUAL_SEARCH = true;
+const SEARCH_INPUT_SELECTORS = [
+  'input[type="search"]',
+  '.t-store__search input',
+  '.js-store-filter-search',
+  '.t-store__filter__search input',
+].join(', ');
+const SEARCH_PRODUCT_TITLE_SELECTORS = [
+  '.t-store__card .t-card__title',
+  '.t-store__card .t-card__title a',
+  '.t-store__prod-popup .t-store__prod-popup__title',
+  '.js-store-prod-name',
+].join(', ');
+const SEARCH_QUERY_DEBOUNCE_MS = 220;
+
+// Google Sheets: публичная CSV-ссылка на таблицу с колонками RU/EN.
+const GOOGLE_SHEETS_SYNC_ENABLED = true;
+const GOOGLE_SHEETS_CSV_URL = 'https://docs.google.com/spreadsheets/d/1nvlPgQxW6HyGKjco5cApHZtSxOpVoMM0Xgv5AuwKzP4/edit?usp=sharing';
+const GOOGLE_SHEETS_FETCH_TIMEOUT_MS = 7000;
+const GOOGLE_SHEETS_SYNC_TTL_MS = 10 * 60 * 1000;
+
+// Логи отладки переводчика (no roots, skipped и т.п.).
+const TRANSLATE_DEBUG_LOGS = false;
 
 const SKIP_TAGS = new Set([
   'SCRIPT',

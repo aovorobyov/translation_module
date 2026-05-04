@@ -17,6 +17,8 @@ const LIBRE_URL = 'https://translate.terraprint.co/translate';
 
 const STORAGE_KEY_LANG  = 'site_lang';
 const STORAGE_KEY_CACHE = 'site_tr_cache';
+const STORAGE_KEY_REMOTE_DICT = 'site_tr_remote_dict';
+const STORAGE_KEY_REMOTE_DICT_TS = 'site_tr_remote_dict_ts';
 const DEFAULT_LANG      = 'ru';
 
 const ATTR_ORIGINAL              = 'data-orig-text';
@@ -79,6 +81,31 @@ const API_MIN_TEXT_LENGTH       = 2;
 const API_REQUIRE_CYRILLIC      = true;
 const API_MAX_UNIQUE_PER_PASS   = 120;
 const TRANSLATABLE_ATTRIBUTES   = ['placeholder', 'value'];
+
+// Двуязычный поиск в каталоге: RU-запросы нормализуем в EN и добавляем RU/EN алиасы к карточкам.
+const ENABLE_BILINGUAL_SEARCH = true;
+const SEARCH_INPUT_SELECTORS = [
+  'input[type="search"]',
+  '.t-store__search input',
+  '.js-store-filter-search',
+  '.t-store__filter__search input',
+].join(', ');
+const SEARCH_PRODUCT_TITLE_SELECTORS = [
+  '.t-store__card .t-card__title',
+  '.t-store__card .t-card__title a',
+  '.t-store__prod-popup .t-store__prod-popup__title',
+  '.js-store-prod-name',
+].join(', ');
+const SEARCH_QUERY_DEBOUNCE_MS = 220;
+
+// Google Sheets: публичная CSV-ссылка на таблицу с колонками RU/EN.
+const GOOGLE_SHEETS_SYNC_ENABLED = true;
+const GOOGLE_SHEETS_CSV_URL = 'https://docs.google.com/spreadsheets/d/1nvlPgQxW6HyGKjco5cApHZtSxOpVoMM0Xgv5AuwKzP4/edit?usp=sharing';
+const GOOGLE_SHEETS_FETCH_TIMEOUT_MS = 7000;
+const GOOGLE_SHEETS_SYNC_TTL_MS = 10 * 60 * 1000;
+
+// Логи отладки переводчика (no roots, skipped и т.п.).
+const TRANSLATE_DEBUG_LOGS = false;
 
 const SKIP_TAGS = new Set([
   'SCRIPT',
@@ -1040,20 +1067,15 @@ function applyCase(translation, profile) {
 //  ПОДГОТОВКА СЛОВАРЕЙ
 // ============================================================
 
+let ACTIVE_DICTIONARY = { ...DICTIONARY };
+
 // Прямой словарь (RU → EN), ключи приведены к нижнему регистру
-const DICT_LOWER = {};
-for (const [k, v] of Object.entries(DICTIONARY)) {
-  DICT_LOWER[k.toLowerCase()] = v;
-}
+let DICT_LOWER = {};
 // Сортировка по убыванию длины: длинные фразы матчим раньше коротких
-const DICT_KEYS = Object.keys(DICT_LOWER).sort((a, b) => b.length - a.length);
+let DICT_KEYS = [];
 
 // Обратный словарь (EN → RU), значения приведены к нижнему регистру
-const DICT_REVERSE_LOWER = {};
-for (const [k, v] of Object.entries(DICTIONARY)) {
-  const vl = v.toLowerCase();
-  if (!DICT_REVERSE_LOWER[vl]) DICT_REVERSE_LOWER[vl] = k;
-}
+let DICT_REVERSE_LOWER = {};
 
 // Псевдонимы — дополнительные английские варианты → русский
 // (нельзя выразить через DICTIONARY из-за ограничения уникальности ключей)
@@ -1069,11 +1091,54 @@ const DICT_REVERSE_ALIASES = {
   'elizaveta': 'Елизавета',    // дубль: Elizaveta / Elisabeth
   'sophie': 'Софи',            // дубль: Sophie / Sofi
 };
-Object.assign(DICT_REVERSE_LOWER, DICT_REVERSE_ALIASES);
+let DICT_REVERSE_KEYS = [];
 
-const DICT_REVERSE_KEYS = Object.keys(DICT_REVERSE_LOWER).sort(
-  (a, b) => b.length - a.length,
-);
+function rebuildDictionaryIndexes() {
+  DICT_LOWER = {};
+  for (const [k, v] of Object.entries(ACTIVE_DICTIONARY)) {
+    if (!k || typeof k !== 'string') continue;
+    if (!v || typeof v !== 'string') continue;
+    DICT_LOWER[k.toLowerCase()] = v;
+  }
+  DICT_KEYS = Object.keys(DICT_LOWER).sort((a, b) => b.length - a.length);
+
+  DICT_REVERSE_LOWER = {};
+  for (const [k, v] of Object.entries(ACTIVE_DICTIONARY)) {
+    if (!k || typeof k !== 'string') continue;
+    if (!v || typeof v !== 'string') continue;
+    const vl = v.toLowerCase();
+    if (!DICT_REVERSE_LOWER[vl]) DICT_REVERSE_LOWER[vl] = k;
+  }
+
+  Object.assign(DICT_REVERSE_LOWER, DICT_REVERSE_ALIASES);
+  DICT_REVERSE_KEYS = Object.keys(DICT_REVERSE_LOWER).sort(
+    (a, b) => b.length - a.length,
+  );
+}
+
+function mergeDictionaryEntries(entries) {
+  if (!entries || typeof entries !== 'object') return 0;
+
+  let changed = 0;
+  for (const [ru, en] of Object.entries(entries)) {
+    const ruText = (ru || '').trim();
+    const enText = (en || '').trim();
+    if (!ruText || !enText) continue;
+
+    if (ACTIVE_DICTIONARY[ruText] !== enText) {
+      ACTIVE_DICTIONARY[ruText] = enText;
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    rebuildDictionaryIndexes();
+  }
+
+  return changed;
+}
+
+rebuildDictionaryIndexes();
 
 // ============================================================
 //  МАТЧИНГ
@@ -1226,6 +1291,204 @@ function saveCache() {
   try {
     localStorage.setItem(STORAGE_KEY_CACHE, JSON.stringify(cache));
   } catch (_) {}
+}
+
+function loadRemoteDictionaryCache() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_REMOTE_DICT) || '{}';
+    const ts = Number(localStorage.getItem(STORAGE_KEY_REMOTE_DICT_TS) || 0);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { entries: null, ts: 0 };
+    return { entries: parsed, ts };
+  } catch (_) {
+    return { entries: null, ts: 0 };
+  }
+}
+
+function saveRemoteDictionaryCache(entries) {
+  try {
+    localStorage.setItem(STORAGE_KEY_REMOTE_DICT, JSON.stringify(entries));
+    localStorage.setItem(STORAGE_KEY_REMOTE_DICT_TS, String(Date.now()));
+  } catch (_) {}
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+
+  result.push(current.trim());
+  return result;
+}
+
+function parseGoogleSheetsCSV(text) {
+  const rows = (text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (!rows.length) return {};
+
+  // Заголовки могут быть не в первой строке (часто A2/B2),
+  // поэтому ищем их в первых строках файла.
+  let headerRowIndex = -1;
+  let ruIndex = -1;
+  let enIndex = -1;
+
+  const scanLimit = Math.min(rows.length, 12);
+  for (let rowIndex = 0; rowIndex < scanLimit; rowIndex += 1) {
+    const headers = parseCSVLine(rows[rowIndex]).map((h) => h.toLowerCase());
+    const maybeRu = headers.findIndex((h) => ['ru', 'рус', 'русский'].includes(h));
+    const maybeEn = headers.findIndex((h) => ['en', 'eng', 'english', 'англ', 'английский'].includes(h));
+    if (maybeRu !== -1 && maybeEn !== -1) {
+      headerRowIndex = rowIndex;
+      ruIndex = maybeRu;
+      enIndex = maybeEn;
+      break;
+    }
+  }
+
+  if (headerRowIndex === -1 || ruIndex === -1 || enIndex === -1) {
+    console.warn('[translate] Google Sheets: expected RU/EN headers not found in first rows');
+    return {};
+  }
+
+  const entries = {};
+  for (let i = headerRowIndex + 1; i < rows.length; i += 1) {
+    const cols = parseCSVLine(rows[i]);
+    const ru = (cols[ruIndex] || '').trim();
+    const en = (cols[enIndex] || '').trim();
+    if (!ru || !en) continue;
+    entries[ru] = en;
+  }
+
+  return entries;
+}
+
+function normalizeGoogleSheetsCSVUrl(url) {
+  const raw = (url || '').trim();
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    const isGoogleSheets = /(^|\.)docs\.google\.com$/.test(parsed.hostname);
+    const sheetMatch = parsed.pathname.match(/\/spreadsheets\/d\/([^/]+)/);
+    if (!isGoogleSheets || !sheetMatch) return raw;
+
+    const sheetId = sheetMatch[1];
+    const gid = parsed.searchParams.get('gid') || '0';
+
+    // Если уже export csv или pubcsv — оставляем как есть.
+    if (parsed.pathname.includes('/export') || parsed.searchParams.get('output') === 'csv') {
+      return raw;
+    }
+
+    return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${encodeURIComponent(gid)}`;
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function fetchGoogleSheetsDictionary() {
+  if (!GOOGLE_SHEETS_SYNC_ENABLED || !GOOGLE_SHEETS_CSV_URL) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOOGLE_SHEETS_FETCH_TIMEOUT_MS);
+  const csvUrl = normalizeGoogleSheetsCSVUrl(GOOGLE_SHEETS_CSV_URL);
+  console.log('[translate] Google Sheets URL:', csvUrl);
+
+  try {
+    const response = await fetch(csvUrl, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn('[translate] Google Sheets fetch failed:', response.status);
+      return null;
+    }
+
+    const csv = await response.text();
+    if (/<!doctype html>|<html/i.test(csv)) {
+      console.warn('[translate] Google Sheets response is HTML, expected CSV. Check table access and URL format.');
+      return null;
+    }
+
+    const parsed = parseGoogleSheetsCSV(csv);
+    console.log('[translate] Google Sheets parsed entries:', Object.keys(parsed).length);
+    return parsed;
+  } catch (err) {
+    console.warn('[translate] Google Sheets fetch error:', err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function syncDictionaryFromGoogleSheets() {
+  if (!GOOGLE_SHEETS_SYNC_ENABLED || !GOOGLE_SHEETS_CSV_URL) return 0;
+
+  const { entries: cachedEntries, ts } = loadRemoteDictionaryCache();
+  const cachedSize = cachedEntries && typeof cachedEntries === 'object'
+    ? Object.keys(cachedEntries).length
+    : 0;
+  const isFresh = ts > 0 && Date.now() - ts < GOOGLE_SHEETS_SYNC_TTL_MS;
+
+  if (isFresh && cachedEntries && cachedSize > 0) {
+    const changed = mergeDictionaryEntries(cachedEntries);
+    console.log('[translate] Google Sheets dictionary source: cache, rows:', cachedSize, 'applied:', changed);
+    return changed;
+  }
+
+  if (isFresh && cachedSize === 0) {
+    console.warn('[translate] Google Sheets cache is empty, forcing refetch');
+  }
+
+  const entries = await fetchGoogleSheetsDictionary();
+  if (!entries) {
+    if (cachedEntries && cachedSize > 0) {
+      const changed = mergeDictionaryEntries(cachedEntries);
+      console.log('[translate] Google Sheets dictionary source: fallback cache, rows:', cachedSize, 'applied:', changed);
+      return changed;
+    }
+    console.warn('[translate] Google Sheets dictionary unavailable, no cache rows');
+    return 0;
+  }
+
+  const fetchedSize = Object.keys(entries).length;
+  if (fetchedSize > 0) {
+    saveRemoteDictionaryCache(entries);
+  } else {
+    console.warn('[translate] Google Sheets fetched 0 rows, cache not overwritten');
+  }
+
+  const changed = mergeDictionaryEntries(entries);
+  console.log('[translate] Google Sheets dictionary source: network, rows:', fetchedSize, 'applied:', changed);
+  return changed;
 }
 
 /**
@@ -1622,7 +1885,9 @@ async function processAttributes(root, lang) {
 async function processNode(root, lang) {
   const roots = getTranslationRoots(root);
   if (!roots.length) {
-    if (lang === 'en') console.log('[translate] no roots for node:', root);
+    if (lang === 'en' && TRANSLATE_DEBUG_LOGS) {
+      console.log('[translate] no roots for node:', root);
+    }
     return;
   }
 
@@ -1643,7 +1908,9 @@ async function processNode(root, lang) {
           while (el) {
             if (shouldSkip(el)) return NodeFilter.FILTER_SKIP;
             if (isExcludedElement(el)) {
-              console.log('[translate] ancestor excluded:', el.className || el.tagName, '→ skipped text:', JSON.stringify(node.nodeValue.trim().slice(0, 40)));
+              if (TRANSLATE_DEBUG_LOGS) {
+                console.log('[translate] ancestor excluded:', el.className || el.tagName, '→ skipped text:', JSON.stringify(node.nodeValue.trim().slice(0, 40)));
+              }
               return NodeFilter.FILTER_SKIP;
             }
             el = el.parentElement;
@@ -1717,21 +1984,25 @@ async function processNode(root, lang) {
       if (shouldSendToAPI(original)) {
         needAPI.push({ node, originalText: original });
       } else if (hasCyrillic(original)) {
-        console.log(
-          '[translate] API skipped for:', JSON.stringify(original.trim().slice(0, 60)),
-          '| cyr:', (original.match(/[А-Яа-яЁё]/g) || []).length,
-          '| lat:', (original.match(/[a-zA-Z]/g) || []).length,
-          '| len:', original.trim().length,
-        );
+        if (TRANSLATE_DEBUG_LOGS) {
+          console.log(
+            '[translate] API skipped for:', JSON.stringify(original.trim().slice(0, 60)),
+            '| cyr:', (original.match(/[А-Яа-яЁё]/g) || []).length,
+            '| lat:', (original.match(/[a-zA-Z]/g) || []).length,
+            '| len:', original.trim().length,
+          );
+        }
       }
     }
   }
 
-  console.log(
-    '[translate] roots:', roots.length,
-    'text nodes:', nodes.length,
-    'api queue:', needAPI.length,
-  );
+  if (TRANSLATE_DEBUG_LOGS) {
+    console.log(
+      '[translate] roots:', roots.length,
+      'text nodes:', nodes.length,
+      'api queue:', needAPI.length,
+    );
+  }
 
   await applyAPI(needAPI);
   await processAttributes(root, 'en');
@@ -1747,6 +2018,7 @@ try {
   currentLang = DEFAULT_LANG;
 }
 let observer = null;
+const searchInputDebouncers = new WeakMap();
 
 // ============================================================
 //  КНОПКИ ПЕРЕКЛЮЧЕНИЯ
@@ -1770,9 +2042,125 @@ async function switchLanguage(lang) {
   setActiveButton(lang);
   try {
     await processNode(document.body, lang);
+    applyBilingualSearchSupport(document.body);
   } catch (err) {
     console.error('[translate] switchLanguage failed:', err);
   }
+}
+
+// ============================================================
+//  ДВУЯЗЫЧНЫЙ ПОИСК
+// ============================================================
+
+function buildSearchAlias(text) {
+  const value = (text || '').trim();
+  if (!value) return null;
+
+  let ru = value;
+  let en = value;
+
+  if (hasCyrillic(value)) {
+    const direct = translateViaDict(value).result.trim();
+    if (direct && !hasCyrillic(direct)) en = direct;
+  } else if (hasLatin(value)) {
+    const reverse = translateViaDictReverse(value).result.trim();
+    if (reverse && hasCyrillic(reverse)) ru = reverse;
+  }
+
+  if (!ru || !en || ru.toLowerCase() === en.toLowerCase()) return null;
+  return `${ru} ${en}`;
+}
+
+function injectSearchAliasIntoTitle(titleEl) {
+  if (!titleEl || titleEl.nodeType !== Node.ELEMENT_NODE) return;
+  if (titleEl.querySelector('.tr-search-alias')) return;
+
+  const titleText = (titleEl.textContent || '').trim();
+  if (!titleText) return;
+
+  const alias = buildSearchAlias(titleText);
+  if (!alias) return;
+
+  const aliasEl = document.createElement('span');
+  aliasEl.className = 'tr-search-alias';
+  aliasEl.setAttribute('data-skip-translate', '1');
+  aliasEl.setAttribute('aria-hidden', 'true');
+  aliasEl.style.cssText = 'position:absolute;left:-99999px;width:1px;height:1px;overflow:hidden;';
+  aliasEl.textContent = ` ${alias}`;
+
+  titleEl.appendChild(aliasEl);
+}
+
+function enhanceSearchAliases(root) {
+  if (!ENABLE_BILINGUAL_SEARCH || !SEARCH_PRODUCT_TITLE_SELECTORS) return;
+  if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+
+  if (root.matches && root.matches(SEARCH_PRODUCT_TITLE_SELECTORS)) {
+    injectSearchAliasIntoTitle(root);
+  }
+
+  if (!root.querySelectorAll) return;
+  root
+    .querySelectorAll(SEARCH_PRODUCT_TITLE_SELECTORS)
+    .forEach(injectSearchAliasIntoTitle);
+}
+
+async function normalizeSearchInput(input) {
+  if (!input || input.dataset.trSearchLock === '1') return;
+
+  const raw = (input.value || '').trim();
+  if (!raw || !hasCyrillic(raw)) return;
+
+  let normalized = translateViaDict(raw).result.trim();
+  if (!normalized || hasCyrillic(normalized)) {
+    const apiValue = await translateViaAPI(raw, 'ru|en');
+    if (apiValue) normalized = apiValue.trim();
+  }
+
+  if (!normalized || hasCyrillic(normalized)) return;
+  if (normalized.toLowerCase() === raw.toLowerCase()) return;
+
+  input.dataset.trSearchLock = '1';
+  input.setAttribute('data-search-original-query', raw);
+  input.value = normalized;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dataset.trSearchLock = '0';
+}
+
+function bindSearchInput(input) {
+  if (!input || input.dataset.trSearchBound === '1') return;
+  input.dataset.trSearchBound = '1';
+
+  input.addEventListener('input', () => {
+    const prev = searchInputDebouncers.get(input);
+    if (prev) clearTimeout(prev);
+
+    const timer = setTimeout(() => {
+      normalizeSearchInput(input).catch((err) => {
+        console.warn('[translate] search normalize failed:', err);
+      });
+    }, SEARCH_QUERY_DEBOUNCE_MS);
+
+    searchInputDebouncers.set(input, timer);
+  });
+}
+
+function bindBilingualSearchInputs(root) {
+  if (!ENABLE_BILINGUAL_SEARCH || !SEARCH_INPUT_SELECTORS) return;
+  if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+
+  if (root.matches && root.matches(SEARCH_INPUT_SELECTORS)) {
+    bindSearchInput(root);
+  }
+
+  if (!root.querySelectorAll) return;
+  root.querySelectorAll(SEARCH_INPUT_SELECTORS).forEach(bindSearchInput);
+}
+
+function applyBilingualSearchSupport(root) {
+  if (!ENABLE_BILINGUAL_SEARCH) return;
+  enhanceSearchAliases(root);
+  bindBilingualSearchInputs(root);
 }
 
 // ============================================================
@@ -1788,6 +2176,7 @@ function startObserver() {
         processNode(added, currentLang).catch((err) => {
           console.error('[translate] mutation translate failed:', err);
         });
+        applyBilingualSearchSupport(added);
       }
     }
   });
@@ -1841,8 +2230,16 @@ function injectStyles() {
 //  ИНИЦИАЛИЗАЦИЯ
 // ============================================================
 
-function init() {
+async function init() {
   console.log('[translate] 🚀 init started, lang:', currentLang);
+
+  try {
+    await syncDictionaryFromGoogleSheets();
+  } catch (err) {
+    console.warn('[translate] Google Sheets sync failed:', err);
+  }
+
+  applyBilingualSearchSupport(document.body);
 
   injectStyles();
   console.log('[translate] ✅ styles injected');
